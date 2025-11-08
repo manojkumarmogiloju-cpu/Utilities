@@ -1,19 +1,17 @@
-# BatchCopyGUI_Final3.ps1  — PowerShell 5.1 compatible
+# BatchCopyGUI_Final4.ps1 — PowerShell 5.1 compatible
 
-# --- Relaunch in STA and keep console open if started via "Run with PowerShell" ---
+# Relaunch in STA and keep console visible if started via "Run with PowerShell"
 if ($host.Runspace.ApartmentState -ne 'STA') {
   $argsList = "-NoProfile -ExecutionPolicy Bypass -NoExit -STA -File `"$PSCommandPath`""
   Start-Process -FilePath "powershell.exe" -ArgumentList $argsList
   exit
 }
-
 $ErrorActionPreference = 'Stop'
 trap {
   try {
     [System.Windows.Forms.MessageBox]::Show(
       ($_.Exception.Message + "`r`n`r`n" + $_.InvocationInfo.PositionMessage),
-      "Error",
-      0, 16
+      "Error", 0, 16
     ) | Out-Null
   } catch {}
   break
@@ -22,46 +20,34 @@ trap {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ---------- Helpers ----------
+# ----- Helpers -----
 function Ensure-Dir([string]$d) {
-  if (-not (Test-Path -LiteralPath $d)) {
-    [void][System.IO.Directory]::CreateDirectory($d)
-  }
+  if (-not (Test-Path -LiteralPath $d)) { [void][System.IO.Directory]::CreateDirectory($d) }
 }
 function RelPath($root,$path){
   try{
-    $r=(Resolve-Path $root).Path
-    if(-not $r.EndsWith('\')){$r+='\'}
+    $r=(Resolve-Path $root).Path; if(-not $r.EndsWith('\')){$r+='\'}
     $u1=[uri]$r; $u2=[uri](Resolve-Path $path).Path
     $rel=$u1.MakeRelativeUri($u2).ToString().Replace('/','\')
     return [System.Uri]::UnescapeDataString($rel)   # fix %20 etc.
   }catch{
     $rn=[System.IO.Path]::GetFullPath((Resolve-Path $root).Path).TrimEnd('\')
     $pn=[System.IO.Path]::GetFullPath((Resolve-Path $path).Path)
-    if($pn.StartsWith($rn,[System.StringComparison]::InvariantCultureIgnoreCase)){
-      return $pn.Substring($rn.Length).TrimStart('\')
-    }
+    if($pn.StartsWith($rn,[System.StringComparison]::InvariantCultureIgnoreCase)){ return $pn.Substring($rn.Length).TrimStart('\') }
     return Split-Path $pn -Leaf
   }
 }
-# PS 5.1/.NET Framework: File.Move has only 2 args, so emulate "overwrite-safe" move
+# PS 5.1: emulate overwrite-safe move
 function Move-FileCompat {
   param([Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination)
-
-  if (Test-Path -LiteralPath $Destination) {
-    Remove-Item -LiteralPath $Destination -Force
-  }
-  try {
-    [System.IO.File]::Move($Source, $Destination)   # 2-arg move on .NET Framework
-  } catch {
-    # Fallback: copy-then-delete (handles cross-volume or sharing quirks)
-    [System.IO.File]::Copy($Source, $Destination, $true)
-    Remove-Item -LiteralPath $Source -Force
-  }
+  if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+  try   { [System.IO.File]::Move($Source, $Destination) }
+  catch { [System.IO.File]::Copy($Source, $Destination, $true); Remove-Item -LiteralPath $Source -Force }
 }
+function Log($m){ $txtOut.AppendText($m+[Environment]::NewLine); [System.Windows.Forms.Application]::DoEvents() }
 
-# ---------- UI ----------
+# ----- UI -----
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Batch Copy/Move (preserve structure)"
 $form.StartPosition = 'CenterScreen'
@@ -78,7 +64,7 @@ $txtSrc = Add-TextBox 130 18 660
 $btnSrc = Add-Button "Browse..." 805 17 80
 $btnSrc.Add_Click({
   $d=New-Object System.Windows.Forms.FolderBrowserDialog
-  if($d.ShowDialog() -eq 'OK'){ $txtSrc.Text=$d.SelectedPath; $global:enumerators=$null; ToggleButtons -state 'idle' }
+  if($d.ShowDialog() -eq 'OK'){ $txtSrc.Text=$d.SelectedPath; Reset-Pipeline }
 })
 
 $lblDst = Add-Label "Destination root:" 15 55
@@ -107,7 +93,7 @@ $form.Controls.Add($chkDry)
 
 $lblFilter = Add-Label "Optional file filter (e.g. *.pdf;*.docx):" 15 165
 $txtFilter = Add-TextBox 275 163 530; $txtFilter.Text='*'
-$txtFilter.Add_TextChanged({ $global:enumerators=$null; ToggleButtons -state 'idle' })
+$txtFilter.Add_TextChanged({ Reset-Pipeline })
 
 $lblLog = Add-Label "CSV log (optional):" 15 200
 $txtLog = Add-TextBox 130 198 660
@@ -130,39 +116,43 @@ $txtOut.Font=New-Object System.Drawing.Font('Consolas', 9)
 $txtOut.Size=New-Object System.Drawing.Size(867, 300)
 $form.Controls.Add($txtOut)
 
-function Log($m){ $txtOut.AppendText($m+[Environment]::NewLine); [System.Windows.Forms.Application]::DoEvents() }
+# ----- Batching state: single, flat, lazy enumerator with peek -----
+$global:fileEnum   = $null   # IEnumerator[string]
+$global:hasPeek    = $false  # bool
+$global:peekValue  = $null   # current string
 
-# ---------- Batching state ----------
-$global:enumerators = $null   # array of IEnumerator[string]
-$global:activeIndex = 0
+function Reset-Pipeline {
+  $global:fileEnum  = $null
+  $global:hasPeek   = $false
+  $global:peekValue = $null
+  ToggleButtons -state 'idle'
+}
 
-function Build-Enumerators {
+function Build-Enumerator {
   $src=$txtSrc.Text.Trim()
-  $patterns=($txtFilter.Text.Trim() -split ';' | ForEach-Object { if([string]::IsNullOrWhiteSpace($_)){'*'} else { $_ } })
-  $list = New-Object System.Collections.Generic.List[System.Collections.Generic.IEnumerator[string]]
-  foreach($p in $patterns){
-    $e = [System.IO.Directory]::EnumerateFiles($src,$p,[System.IO.SearchOption]::AllDirectories).GetEnumerator()
-    $null = $e.MoveNext()    # prime
-    $list.Add($e) | Out-Null
+  $patterns = ($txtFilter.Text.Trim() -split ';' | ForEach-Object { if([string]::IsNullOrWhiteSpace($_)){'*'} else { $_ } })
+
+  # Flatten all patterns into ONE sequence (lazy)
+  $sequence = foreach($p in $patterns) {
+    foreach($f in [System.IO.Directory]::EnumerateFiles($src,$p,[System.IO.SearchOption]::AllDirectories)) { $f }
   }
-  $global:enumerators = $list.ToArray()
-  $global:activeIndex = 0
+
+  $global:fileEnum = $sequence.GetEnumerator()
+  $global:hasPeek  = $global:fileEnum.MoveNext()
+  if($global:hasPeek){ $global:peekValue = $global:fileEnum.Current }
 }
 
 function Has-NextItem {
-  if(-not $global:enumerators -or $global:enumerators.Count -eq 0){ return $false }
-  for($i=$global:activeIndex; $i -lt $global:enumerators.Count; $i++){
-    $e = $global:enumerators[$i]
-    if($e -and $e.Current){ $global:activeIndex=$i; return $true }
-    while($e -and $e.MoveNext()){ if($e.Current){ $global:activeIndex=$i; return $true } }
-  }
-  return $false
+  if(-not $global:fileEnum){ Build-Enumerator }
+  return $global:hasPeek
 }
+
 function Next-Item {
-  $i=$global:activeIndex; $e=$global:enumerators[$i]
-  $c=$e.Current
-  if(-not $e.MoveNext()){ $global:activeIndex=$i+1 }
-  return $c
+  if(-not $global:hasPeek){ return $null }
+  $current = $global:peekValue
+  $global:hasPeek = $global:fileEnum.MoveNext()
+  if($global:hasPeek){ $global:peekValue = $global:fileEnum.Current } else { $global:peekValue = $null }
+  return $current
 }
 
 function Validate-Roots {
@@ -180,7 +170,7 @@ function ToggleButtons([string]$state) {
   }
 }
 
-# ---------- Actions ----------
+# ----- Actions -----
 $btnEstimate.Add_Click({
   $r=Validate-Roots; if(-not $r){ return }
   $patterns=$txtFilter.Text.Trim() -split ';'
@@ -193,16 +183,11 @@ $btnEstimate.Add_Click({
   Log "Estimated files matching filter: $count"
 })
 
-$btnReset.Add_Click({
-  $global:enumerators=$null
-  ToggleButtons -state 'idle'
-  Log "Pipeline reset. Next batch will scan from the beginning."
-})
+$btnReset.Add_Click({ Reset-Pipeline; Log "Pipeline reset. Next batch will scan from the beginning." })
 
 function Run-Batch {
   param([switch]$IsFirst)
   $r=Validate-Roots; if(-not $r){ return }
-  if(-not $global:enumerators){ Build-Enumerators }
 
   $batch=[int]$nudBatch.Value; $move=$optMove.Checked; $dry=$chkDry.Checked
   $logp=$txtLog.Text.Trim()
@@ -248,7 +233,7 @@ function Run-Batch {
 }
 
 $btnStart.Add_Click({ Run-Batch -IsFirst })
-$btnNext.Add_Click({ Run-Batch })
+$btnNext.Add_Click({  Run-Batch })
 
 # initial state
 ToggleButtons -state 'idle'
